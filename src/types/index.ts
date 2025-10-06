@@ -5,3 +5,4 @@ export type {
   ProcessPaymentEventResult,
   LoyaltyCalculation,
 } from './loyalty.types';
+export type { WebhookPayload, WebhookResponse, WebhookErrorResponse } from './webhook.types';
