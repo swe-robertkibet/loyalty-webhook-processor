@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { Config } from '../types/config.types';
 
 const configSchema = z.object({
   database: z.object({
@@ -25,8 +26,6 @@ const configSchema = z.object({
     level: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   }),
 });
-
-export type Config = z.infer<typeof configSchema>;
 
 function loadConfig(): Config {
   const rawConfig = {
