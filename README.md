@@ -2,11 +2,11 @@
 
 ## Overview
 
-The **Loyalty Webhook Processor** is a production-ready Node.js service that processes payment webhooks and awards loyalty points to users in a reliable, idempotent manner. This system is designed to handle webhook retries gracefully, ensuring that duplicate webhook deliveries never result in duplicate point awards—a critical requirement for financial systems where accuracy is paramount.
+The **Loyalty Webhook Processor** is a Node.js service that processes payment webhooks and awards loyalty points to users in a reliable, idempotent manner. This system handles webhook retries gracefully, ensuring that duplicate webhook deliveries never result in duplicate point awards. Financial systems require accuracy, and this service prevents duplicate processing.
 
-Built with TypeScript, this service implements a robust webhook processing pipeline featuring HMAC signature verification for security, schema validation for data integrity, and a two-layer idempotency mechanism to prevent duplicate processing. The architecture leverages BullMQ (backed by Redis) for asynchronous job processing, enabling retry logic with exponential backoff and horizontal scaling capabilities. PostgreSQL with Prisma ORM provides transactional consistency, ensuring user points and transaction records remain synchronized even during failures.
+Built with TypeScript, this service implements a webhook processing pipeline with HMAC signature verification for security, schema validation for data integrity, and a two-layer idempotency mechanism to prevent duplicate processing. The architecture uses BullMQ (backed by Redis) for asynchronous job processing, enabling retry logic with exponential backoff and horizontal scaling capabilities. PostgreSQL with Prisma ORM provides transactional consistency, ensuring user points and transaction records remain synchronized even during failures.
 
-The service exposes RESTful APIs for querying user points and transaction history, along with health check and Prometheus metrics endpoints for observability. This design prioritizes reliability, security, and scalability—making it suitable for high-volume payment processing environments.
+The service exposes RESTful APIs for querying user points and transaction history, along with health check and Prometheus metrics endpoints for observability. This design prioritizes reliability, security, and scalability. It handles high-volume payment processing environments.
 
 **Tech Stack:** Node.js, TypeScript, Express, BullMQ, Redis, PostgreSQL, Prisma, Zod, Pino
 
@@ -30,7 +30,7 @@ The service exposes RESTful APIs for querying user points and transaction histor
 
 #### `src/server.ts`
 
-The main entry point for the Express HTTP server. This file sets up the Express application with middleware including Pino HTTP logger for structured request logging, JSON body parser, and request routing. It registers all API routes (`/webhooks`, `/users`, `/transactions`, `/health`, `/metrics`) and implements comprehensive error handling with a 404 handler for undefined routes and a global error handler. The server includes graceful shutdown logic that responds to SIGTERM and SIGINT signals, allowing in-flight requests to complete before closing. It also handles unhandled promise rejections and uncaught exceptions to prevent silent failures.
+The main entry point for the Express HTTP server. This file sets up the Express application with middleware including Pino HTTP logger for structured request logging, JSON body parser, and request routing. It registers all API routes (`/webhooks`, `/users`, `/transactions`, `/health`, `/metrics`) and implements error handling with a 404 handler for undefined routes and a global error handler. The server includes graceful shutdown logic that responds to SIGTERM and SIGINT signals, allowing in-flight requests to complete before closing. It also handles unhandled promise rejections and uncaught exceptions to prevent silent failures.
 
 #### `src/worker.ts`
 
@@ -44,7 +44,7 @@ Configures the BullMQ queue connection to Redis and defines default job options.
 
 #### `src/routes/webhook.ts`
 
-The most critical route in the application—handles incoming payment webhooks. This endpoint implements the first line of defense with HMAC SHA-256 signature verification to ensure webhooks originate from trusted sources. If the signature is missing or invalid, it immediately returns a 401 error. Next, it validates the payload structure using Zod schema validation, checking that required fields (`eventId`, `type`, `userId`, `amount`, `currency`, `timestamp`) are present and correctly typed. The core idempotency mechanism creates an Event record with a unique constraint on `eventId`. If a duplicate event arrives (Prisma error P2002), it returns 200 with "already received and processed"—preventing duplicate job creation. For new events, it enqueues a job to BullMQ and returns 202 Accepted, acknowledging receipt without waiting for processing to complete.
+The main webhook route in the application: handles incoming payment webhooks. This endpoint implements the first line of defense with HMAC SHA-256 signature verification to ensure webhooks originate from trusted sources. If the signature is missing or invalid, it immediately returns a 401 error. Next, it validates the payload structure using Zod schema validation, checking that required fields (`eventId`, `type`, `userId`, `amount`, `currency`, `timestamp`) are present and correctly typed. The core idempotency mechanism creates an Event record with a unique constraint on `eventId`. If a duplicate event arrives (Prisma error P2002), it returns 200 with "already received and processed", preventing duplicate job creation. For new events, it enqueues a job to BullMQ and returns 202 Accepted, acknowledging receipt without waiting for processing to complete.
 
 #### `src/routes/users.ts`
 
@@ -56,7 +56,7 @@ Implements a paginated GET endpoint for querying transaction history. It accepts
 
 #### `src/routes/health.ts`
 
-Provides a comprehensive health check endpoint that tests connectivity to critical dependencies. It performs actual queries to PostgreSQL (`SELECT 1`) and Redis (PING command), measuring latency for each. The endpoint returns 200 if all services are healthy, or 503 if any service is down. This health check is essential for Kubernetes liveness/readiness probes and load balancer health monitoring. The latency measurements help diagnose performance degradation.
+Provides a health check endpoint that tests connectivity to database and cache dependencies. It performs actual queries to PostgreSQL (`SELECT 1`) and Redis (PING command), measuring latency for each. The endpoint returns 200 if all services are healthy, or 503 if any service is down. This health check supports Kubernetes liveness/readiness probes and load balancer health monitoring. The latency measurements help diagnose performance degradation.
 
 #### `src/routes/metrics.ts`
 
@@ -72,7 +72,7 @@ Contains the core business logic for loyalty point calculation and award. The `c
 
 #### `src/utils/config.ts`
 
-Manages environment variable configuration with type-safe validation using Zod. It defines a schema for all required configuration: database URL, Redis URL, server port/environment, webhook secret, loyalty points rate, queue settings, and log level. The validation happens at startup—if any required variable is missing or invalid, the application exits with a clear error message before processing any requests. This fail-fast approach prevents runtime errors from misconfiguration. Default values are provided for optional settings like port (3000) and points rate (1).
+Manages environment variable configuration with type-safe validation using Zod. It defines a schema for all required configuration: database URL, Redis URL, server port/environment, webhook secret, loyalty points rate, queue settings, and log level. The validation happens at startup. If any required variable is missing or invalid, the application exits with a clear error message before processing any requests. This fail-fast approach prevents runtime errors from misconfiguration. Default values are provided for optional settings like port (3000) and points rate (1).
 
 #### `src/utils/logger.ts`
 
@@ -118,11 +118,11 @@ Webhooks must respond quickly (typically within 5 seconds) to avoid timeout-trig
 
 ### Why Use Atomic Database Transactions?
 
-The loyalty service wraps user creation, point incrementation, and transaction creation in a Prisma `$transaction` block, making these operations atomic. **Without atomicity**, a failure after incrementing points but before creating the transaction record would result in "phantom points"—points in the user's balance with no corresponding transaction history. This breaks accounting invariants and makes auditing impossible. **With atomicity**, either all operations succeed together or none do, maintaining the invariant that `user.points === sum(transactions.points)`. The trade-off is slightly lower performance (transactions hold locks longer) and potential for deadlocks under high concurrency, but these risks are mitigated by proper indexing and connection pooling. The correctness guarantee is worth the performance cost.
+The loyalty service wraps user creation, point incrementation, and transaction creation in a Prisma `$transaction` block, making these operations atomic. **Without atomicity**, a failure after incrementing points but before creating the transaction record would result in "phantom points": points in the user's balance with no corresponding transaction history. This breaks accounting invariants and makes auditing impossible. **With atomicity**, either all operations succeed together or none do, maintaining the invariant that `user.points === sum(transactions.points)`. The trade-off is slightly lower performance (transactions hold locks longer) and potential for deadlocks under high concurrency, but these risks are mitigated by proper indexing and connection pooling. The correctness guarantee is worth the performance cost.
 
 ### Why HMAC SHA-256 for Webhook Signatures?
 
-Webhooks are public HTTP endpoints accessible to anyone on the internet, creating a security risk: malicious actors could submit fake payment events to award themselves points fraudulently. **HMAC (Hash-based Message Authentication Code) signatures** provide cryptographic verification that webhooks originate from the legitimate payment provider. The payment provider signs each webhook payload with a shared secret using SHA-256, and our service verifies the signature matches before processing. The `crypto.timingSafeEqual` function prevents timing attacks where an attacker measures response times to guess the signature byte-by-byte. This is a standard approach used by Stripe, GitHub, and other webhook providers. The trade-off is operational complexity (secret key management) and a slight performance cost, but this is essential for financial system security.
+Webhooks are public HTTP endpoints accessible to anyone on the internet, creating a security risk: malicious actors could submit fake payment events to award themselves points fraudulently. **HMAC (Hash-based Message Authentication Code) signatures** provide cryptographic verification that webhooks originate from the legitimate payment provider. The payment provider signs each webhook payload with a shared secret using SHA-256, and our service verifies the signature matches before processing. The `crypto.timingSafeEqual` function prevents timing attacks where an attacker measures response times to guess the signature byte-by-byte. This is a standard approach used by Stripe, GitHub, and other webhook providers. The trade-off is operational complexity (secret key management) and a slight performance cost, but this is necessary for financial system security.
 
 ### Why Zod for Runtime Validation?
 
@@ -184,7 +184,7 @@ npm run test:idempotency   # Runs end-to-end idempotency test
 
 ## Observability
 
-The service provides comprehensive observability through:
+The service provides observability through:
 
 - **Structured Logging**: Pino JSON logs with request IDs for tracing
 - **Health Checks**: `/health` endpoint for load balancer probes
