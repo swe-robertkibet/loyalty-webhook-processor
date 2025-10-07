@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { z } from 'zod';
 import type { Config } from '../types/config.types';
 
