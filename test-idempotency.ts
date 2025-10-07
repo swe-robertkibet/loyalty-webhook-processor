@@ -1,4 +1,5 @@
 import { generateWebhookSignature } from './src/utils/verifySignature';
+import { prisma } from './src/db';
 
 const BASE_URL = 'http://localhost:3000';
 
@@ -26,6 +27,39 @@ interface TransactionData {
   }>;
 }
 
+async function cleanupTestData() {
+  console.log('Cleaning up test data...');
+
+  await prisma.event.deleteMany({
+    where: {
+      eventId: {
+        startsWith: 'test-payment-',
+      },
+    },
+  });
+
+  await prisma.transaction.deleteMany({
+    where: {
+      eventId: {
+        startsWith: 'test-payment-',
+      },
+    },
+  });
+
+  const testUser = await prisma.user.findUnique({
+    where: { id: 'user-alice' },
+  });
+
+  if (testUser) {
+    await prisma.user.update({
+      where: { id: 'user-alice' },
+      data: { points: 0 },
+    });
+  }
+
+  console.log('Cleanup completed.\n');
+}
+
 async function sendWebhook(payload: WebhookPayload): Promise<any> {
   const payloadString = JSON.stringify(payload);
   const signature = generateWebhookSignature(payloadString);
@@ -47,9 +81,13 @@ async function testIdempotency() {
   console.log('Testing Webhook Idempotency\n');
   console.log('=' .repeat(60));
 
+  await cleanupTestData();
+
+  const uniqueEventId = `test-payment-${Date.now()}`;
+
   // LEts TEST PAYLOAD
   const payload: WebhookPayload = {
-    eventId: 'test-payment-12345',
+    eventId: uniqueEventId,
     type: 'payment.completed',
     userId: 'user-alice',
     amount: 10000,
@@ -92,16 +130,27 @@ async function testIdempotency() {
 
   console.log('\n' + '='.repeat(60));
   console.log('\nIDEMPOTENCY TEST RESULTS:');
-  console.log(`   • First request: ${response1.data.message}`);
-  console.log(`   • Second request: ${response2.data.message}`);
-  console.log(`   • User points: ${userData.points} (should be 1, not 2)`);
+  console.log(`   • First request status: ${response1.status} - ${response1.data.message}`);
+  console.log(`   • Second request status: ${response2.status} - ${response2.data.message}`);
+  console.log(`   • User points: ${userData.points} (should be 100, not 200 for $100 payment)`);
   console.log(`   • Transaction count: ${txCount} (should be 1, not 2)`);
 
-  if (userData.points === 1 && txCount === 1) {
+  const firstRequestCreated = response1.status === 202;
+  const secondRequestRejected = response2.status === 200 && response2.data.message.includes('already received');
+  const correctPoints = userData.points === 100;
+  const singleTransaction = txCount === 1;
+
+  if (firstRequestCreated && secondRequestRejected && correctPoints && singleTransaction) {
     console.log('\nIDEMPOTENCY TEST PASSED! Points awarded only once.');
   } else {
-    console.log('\nIDEMPOTENCY TEST FAILED! Duplicate points detected.');
+    console.log('\nIDEMPOTENCY TEST FAILED!');
+    if (!firstRequestCreated) console.log('   - First request did not create event (expected 202)');
+    if (!secondRequestRejected) console.log('   - Second request was not rejected as duplicate (expected 200 with "already received")');
+    if (!correctPoints) console.log('   - Incorrect points awarded');
+    if (!singleTransaction) console.log('   - Multiple transactions created');
   }
+
+  await prisma.$disconnect();
 }
 
 testIdempotency().catch(console.error);
