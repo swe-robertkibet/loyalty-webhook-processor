@@ -14,108 +14,13 @@ The service exposes RESTful APIs for querying user points and transaction histor
 
 ## System Architecture
 
-```mermaid
-graph LR
-    subgraph External
-        Client[External System<br/>Payment Provider]
-    end
-
-    subgraph "API Server"
-        Server[Express Server<br/>Port 3000]
-        WebhookRoute[Webhook Route<br/>POST /webhooks/payment]
-        UsersRoute[Users Route<br/>GET /users/:id]
-        TxRoute[Transactions Route<br/>GET /transactions]
-        HealthRoute[Health Route<br/>GET /health]
-        MetricsRoute[Metrics Route<br/>GET /metrics]
-    end
-
-    subgraph "Processing Layer"
-        Queue[(Redis Queue<br/>BullMQ)]
-        Worker[Worker Process<br/>Job Consumer]
-        Loyalty[Loyalty Service<br/>Business Logic]
-    end
-
-    subgraph "Data Layer"
-        DB[(PostgreSQL<br/>User, Event, Transaction)]
-    end
-
-    Client -->|Step 1: POST webhook + signature| WebhookRoute
-    WebhookRoute -->|Step 2: Verify & Validate| WebhookRoute
-    WebhookRoute -->|Step 3: Create Unique Event| DB
-    WebhookRoute -->|Step 4: Enqueue Job| Queue
-    WebhookRoute -->|Step 5: Return 202 Accepted| Client
-
-    Queue -->|Step 6: Pull Job| Worker
-    Worker -->|Step 7: Process Payment| Loyalty
-    Loyalty -->|Step 8: Check Duplicate & Update Points| DB
-    Worker -->|Step 9: Update Event Status| DB
-
-    Server --> UsersRoute
-    Server --> TxRoute
-    Server --> HealthRoute
-    Server --> MetricsRoute
-    UsersRoute --> DB
-    TxRoute --> DB
-    HealthRoute --> DB
-    HealthRoute --> Queue
-
-    style WebhookRoute fill:#ffcc99
-    style Loyalty fill:#99ccff
-    style DB fill:#cc99ff
-    style Queue fill:#99ffcc
-```
+![System Architecture](images/architecture.png)
 
 ---
 
 ## Request Flow & Idempotency
 
-```mermaid
-flowchart TD
-    Start([Webhook Request]) --> VerifySig{Signature<br/>Valid?}
-    VerifySig -->|No| Reject401[Return 401<br/>Invalid Signature]
-    VerifySig -->|Yes| ValidatePayload{Payload<br/>Valid?}
-
-    ValidatePayload -->|No| Reject400[Return 400<br/>Invalid Payload]
-    ValidatePayload -->|Yes| CreateEvent[Create Event<br/>in Database]
-
-    CreateEvent --> CheckDup1{Event<br/>Already<br/>Exists?}
-    CheckDup1 -->|Yes - P2002| Return200Dup[Return 200<br/>Already Processed<br/>🛡️ IDEMPOTENCY LAYER 1]
-    CheckDup1 -->|No - Created| EnqueueJob[Enqueue Job<br/>to BullMQ]
-
-    EnqueueJob --> Return202[Return 202<br/>Queued for Processing]
-
-    Return202 --> WorkerPick[Worker Picks Job<br/>from Queue]
-    WorkerPick --> UpdateAttempt[Update Event<br/>Attempt Count]
-    UpdateAttempt --> CallLoyalty[Call Loyalty Service]
-
-    CallLoyalty --> CheckDup2{Transaction<br/>Already<br/>Exists?}
-    CheckDup2 -->|Yes| ReturnExisting[Return Existing<br/>Transaction Data<br/>🛡️ IDEMPOTENCY LAYER 2]
-    CheckDup2 -->|No| CalcPoints[Calculate Points<br/>1 point per $1]
-
-    CalcPoints --> AtomicTx[Atomic Transaction:<br/>1. Upsert User<br/>2. Increment Points<br/>3. Create Transaction]
-
-    AtomicTx --> TxSuccess{Success?}
-    TxSuccess -->|No| Retry{Attempts < 5?}
-    Retry -->|Yes| WorkerPick
-    Retry -->|No| MarkFailed[Mark Event Failed]
-
-    TxSuccess -->|Yes| MarkProcessed[Mark Event Processed]
-    ReturnExisting --> MarkProcessed
-
-    MarkProcessed --> End([Complete])
-    MarkFailed --> End
-    Reject401 --> End
-    Reject400 --> End
-    Return200Dup --> End
-
-    style Return200Dup fill:#ffffcc
-    style ReturnExisting fill:#ffffcc
-    style CalcPoints fill:#ccffcc
-    style AtomicTx fill:#ccffcc
-    style Reject401 fill:#ffcccc
-    style Reject400 fill:#ffcccc
-    style MarkFailed fill:#ffcccc
-```
+![Request Flow & Idempotency](images/flow.png)
 
 ---
 
@@ -123,49 +28,49 @@ flowchart TD
 
 ### Core Application Files
 
-#### `src/server.ts` (104 lines)
+#### `src/server.ts`
 
 The main entry point for the Express HTTP server. This file sets up the Express application with middleware including Pino HTTP logger for structured request logging, JSON body parser, and request routing. It registers all API routes (`/webhooks`, `/users`, `/transactions`, `/health`, `/metrics`) and implements comprehensive error handling with a 404 handler for undefined routes and a global error handler. The server includes graceful shutdown logic that responds to SIGTERM and SIGINT signals, allowing in-flight requests to complete before closing. It also handles unhandled promise rejections and uncaught exceptions to prevent silent failures.
 
-#### `src/worker.ts` (125 lines)
+#### `src/worker.ts`
 
 The BullMQ worker process that consumes jobs from the Redis queue. This runs as a separate process from the HTTP server, enabling independent scaling of job processing capacity. The worker is configured with a concurrency of 5, meaning it can process 5 jobs simultaneously. It includes rate limiting (10 jobs per second) to prevent overwhelming downstream systems. For each job, the worker updates the event's attempt count, calls the loyalty service to process the payment, and updates the event status to either "processed" or "failed". The worker implements event handlers for job completion and failure, logging all outcomes. Like the server, it includes graceful shutdown handling to allow running jobs to complete before terminating.
 
-#### `src/queue.ts` (58 lines)
+#### `src/queue.ts`
 
 Configures the BullMQ queue connection to Redis and defines default job options. Jobs are configured with automatic retry logic (5 attempts maximum) using exponential backoff starting at 1 second. This means retries happen at roughly 1s, 2s, 4s, 8s, and 16s intervals. The queue automatically removes completed jobs after 100 jobs or 1 hour, and failed jobs after 24 hours, preventing unbounded growth of job records. This file also sets up queue event monitoring, logging job completions, failures, and stalled jobs. The QueueEvents listener provides real-time visibility into job processing status.
 
 ### Route Handlers
 
-#### `src/routes/webhook.ts` (122 lines)
+#### `src/routes/webhook.ts`
 
 The most critical route in the application—handles incoming payment webhooks. This endpoint implements the first line of defense with HMAC SHA-256 signature verification to ensure webhooks originate from trusted sources. If the signature is missing or invalid, it immediately returns a 401 error. Next, it validates the payload structure using Zod schema validation, checking that required fields (`eventId`, `type`, `userId`, `amount`, `currency`, `timestamp`) are present and correctly typed. The core idempotency mechanism creates an Event record with a unique constraint on `eventId`. If a duplicate event arrives (Prisma error P2002), it returns 200 with "already received and processed"—preventing duplicate job creation. For new events, it enqueues a job to BullMQ and returns 202 Accepted, acknowledging receipt without waiting for processing to complete.
 
-#### `src/routes/users.ts` (46 lines)
+#### `src/routes/users.ts`
 
 Provides a GET endpoint to retrieve a user's current loyalty points balance and metadata. This endpoint queries the User table by ID and returns the user's points, email, name, and timestamps. If the user doesn't exist, it returns a 404 error with a clear error message. This simple read-only endpoint is useful for customer support dashboards and user account pages.
 
-#### `src/routes/transactions.ts` (59 lines)
+#### `src/routes/transactions.ts`
 
 Implements a paginated GET endpoint for querying transaction history. It accepts optional query parameters: `userId` to filter by user, `limit` (default 100, max 1000) for page size, and `offset` for pagination. Transactions are ordered by creation date descending, showing most recent first. This endpoint enables transaction history display in user interfaces and supports auditing requirements. The response includes metadata about count, limit, and offset for pagination control.
 
-#### `src/routes/health.ts` (57 lines)
+#### `src/routes/health.ts`
 
 Provides a comprehensive health check endpoint that tests connectivity to critical dependencies. It performs actual queries to PostgreSQL (`SELECT 1`) and Redis (PING command), measuring latency for each. The endpoint returns 200 if all services are healthy, or 503 if any service is down. This health check is essential for Kubernetes liveness/readiness probes and load balancer health monitoring. The latency measurements help diagnose performance degradation.
 
-#### `src/routes/metrics.ts` (48 lines)
+#### `src/routes/metrics.ts`
 
 Exposes Prometheus-format metrics for observability. Includes Node.js default metrics (memory, CPU, event loop lag) plus custom application metrics: `webhook_requests_total` (counter by status), `job_processing_duration_seconds` (histogram with buckets), `queue_size` (gauge), and `loyalty_points_awarded_total` (counter). These metrics enable monitoring dashboards, alerting, and capacity planning. The Prometheus format makes it compatible with Grafana and other monitoring tools.
 
 ### Business Logic
 
-#### `src/services/loyalty.ts` (105 lines)
+#### `src/services/loyalty.ts`
 
 Contains the core business logic for loyalty point calculation and award. The `calculatePoints` method implements the rule: 1 loyalty point per $1 spent (amount in cents / 100). The `processPaymentEvent` method implements the second layer of idempotency by checking if a transaction already exists for the given `eventId`. If found, it returns the existing transaction data without creating duplicates. For new transactions, it uses Prisma's `$transaction` API to perform an atomic database transaction: (1) find or create the user with initial 0 points, (2) increment the user's points by the calculated amount, (3) create a transaction record linking the eventId, userId, amount, and points. This atomicity ensures the user's point balance always matches the sum of their transactions, even if errors occur mid-process.
 
 ### Utilities
 
-#### `src/utils/config.ts` (69 lines)
+#### `src/utils/config.ts`
 
 Manages environment variable configuration with type-safe validation using Zod. It defines a schema for all required configuration: database URL, Redis URL, server port/environment, webhook secret, loyalty points rate, queue settings, and log level. The validation happens at startup—if any required variable is missing or invalid, the application exits with a clear error message before processing any requests. This fail-fast approach prevents runtime errors from misconfiguration. Default values are provided for optional settings like port (3000) and points rate (1).
 
@@ -173,13 +78,13 @@ Manages environment variable configuration with type-safe validation using Zod. 
 
 Sets up the Pino structured logger with environment-specific configuration. In development, it uses `pino-pretty` for human-readable colored output. In production, it outputs JSON logs for log aggregation systems like ELK or Datadog. Structured logging includes contextual fields (eventId, userId, jobId) in each log entry, making it easy to trace requests through the entire processing pipeline.
 
-#### `src/utils/verifySignature.ts` (31 lines)
+#### `src/utils/verifySignature.ts`
 
 Implements HMAC SHA-256 signature verification for webhook security. The `verifyWebhookSignature` function expects a signature in the format "sha256=hexhash", validates the format, computes the expected HMAC using the configured secret, and performs a timing-safe comparison using `crypto.timingSafeEqual` to prevent timing attacks. The companion `generateWebhookSignature` function is used in tests to create valid signatures. This security measure prevents unauthorized parties from submitting fake webhooks.
 
 ### Database
 
-#### `prisma/schema.prisma` (42 lines)
+#### `prisma/schema.prisma`
 
 Defines the PostgreSQL database schema with three models: **User** stores user account information with points balance (default 0), supporting optional email and name fields. The `id` field uses CUID for universally unique identifiers. **Event** records each webhook received, with a unique constraint on `eventId` to enforce idempotency at the database level. It tracks processing status (pending/processed/failed), attempt count, and timestamps. **Transaction** represents each loyalty point award, storing the eventId (for duplicate checks), userId (foreign key to User), payment amount in cents, and points awarded. The schema includes an index on userId for efficient transaction queries and enforces referential integrity between transactions and users.
 
@@ -189,13 +94,13 @@ Simple re-exports of the Prisma client instance, providing a centralized databas
 
 ### Type Definitions
 
-#### `src/types/*.ts` (6 files)
+#### `src/types/*.ts`
 
 TypeScript type definitions organized by domain: `config.types.ts` (application configuration), `queue.types.ts` (BullMQ job payloads), `loyalty.types.ts` (loyalty service interfaces), `webhook.types.ts` (webhook request/response shapes), `api.types.ts` (REST API responses). The `index.ts` barrel file re-exports all types for convenient importing. These types provide compile-time safety and enable excellent IDE autocomplete, reducing bugs from typos or incorrect data structures.
 
 ### Testing
 
-#### `test-idempotency.ts` (164 lines)
+#### `test-idempotency.ts`
 
 An end-to-end integration test that validates the system's idempotency guarantees. The test performs cleanup of previous test data, generates a unique eventId using timestamp, sends the same webhook twice with valid HMAC signatures, waits for worker processing, and verifies that: (1) the first request returns 202 (queued), (2) the second request returns 200 (duplicate detected), (3) exactly 100 points are awarded (not 200), and (4) exactly 1 transaction is created (not 2). This test exercises the entire system including signature verification, database constraints, queue processing, and service-layer duplicate detection. It provides confidence that duplicate webhooks will never result in duplicate point awards.
 
