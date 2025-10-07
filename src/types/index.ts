@@ -6,3 +6,9 @@ export type {
   LoyaltyCalculation,
 } from './loyalty.types';
 export type { WebhookPayload, WebhookResponse, WebhookErrorResponse } from './webhook.types';
+export type {
+  UserResponse,
+  TransactionResponse,
+  HealthResponse,
+  ErrorResponse,
+} from './api.types';
